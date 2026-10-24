@@ -1,0 +1,22 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Dartsnut PixelDart",
+        "description": "Enter the IP address or hostname of your Dartsnut Raspberry Pi.",
+        "data": {
+          "host": "Host / IP Address",
+          "ws_port": "WebSocket Port",
+          "mcp_port": "MCP HTTP Port"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to Dartsnut device on WebSocket/MCP ports",
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "Device is already configured"
+    }
+  }
+}

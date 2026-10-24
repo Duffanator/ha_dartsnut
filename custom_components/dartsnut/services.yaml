@@ -1,0 +1,11 @@
+start_game:
+  name: Start Game
+  description: Launch a game on the Dartsnut board by its game_id.
+  fields:
+    game_id:
+      name: Game ID
+      description: The Dartsnut game identifier (e.g. pico8, cricket, 301).
+      required: true
+      example: "pico8"
+      selector:
+        text:

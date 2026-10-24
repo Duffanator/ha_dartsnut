@@ -1,0 +1,12 @@
+{
+  "domain": "dartsnut",
+  "name": "Dartsnut PixelDart",
+  "codeowners": ["@Duffanator"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/Duffanator/ha_dartsnut",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/Duffanator/ha_dartsnut/issues",
+  "requirements": [],
+  "version": "1.0.0"
+}
