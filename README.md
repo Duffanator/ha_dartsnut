@@ -59,13 +59,3 @@ Communicates 100% locally with the Raspberry Pi's built-in WebSocket server (`:9
 * **`dartsnut.start_game`**: Launch any game on the board by its `game_id` (e.g., `douseadarts`, `01dartgame`, `cricket`, `aroundtheworld`, `pico8`).
 
 ---
-
-## Custom Games (`games/douseadarts`)
-
-This repository also includes **Dousea Darts (`douseadarts`)** under [`games/douseadarts/`](games/douseadarts/) — a custom Basement Arcade edition of `x01` darts (`301 / 501 / 701 / 901 / 1101 / 1501`) featuring a neon CRT palette, 8-bit crosshair/spark impact animations, floating score callouts, and CRT laser curtain turn-switch transitions.
-
-To install or restore **Dousea Darts** on your Dartsnut board over its local WebSocket/MCP API:
-
-```bash
-node games/douseadarts/deploy_douseadarts.js 172.16.102.254
-```
