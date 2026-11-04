@@ -7,10 +7,11 @@ import copy
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, OPTION_GAME_NONE, OPTION_ROTATE_ALL, SCREEN_OFF_PAGE_UUID
+from .const import DOMAIN, OPTION_GAME_NONE, OPTION_ROTATE_ALL
 from .coordinator import DartsnutCoordinator
 
 
@@ -54,32 +55,48 @@ class DartsnutWidgetPageSelect(CoordinatorEntity[DartsnutCoordinator], SelectEnt
         return self.coordinator.get_current_page_option()
 
     async def async_select_option(self, option: str) -> None:
-        """Select a widget page or enable rotation across all pages."""
+        """Select a widget page or restore multi-page rotation."""
+        await self.coordinator.async_load_store()
+        page_map = self.coordinator.get_page_options_map()
+        if option != OPTION_ROTATE_ALL and option not in page_map:
+            raise ServiceValidationError(f"Unknown widget page option: {option}")
+
         conf = await self.coordinator.client.get_conf_json()
         raw_pages = copy.deepcopy(conf.get("pages") or [])
         if not raw_pages:
             return
 
-        page_map = self.coordinator.get_page_options_map()
+        currently_enabled = [
+            str(p.get("uuid"))
+            for p in raw_pages
+            if isinstance(p, dict)
+            and p.get("uuid") not in (None, "", "0")
+            and p.get("enabled", True)
+        ]
+        if len(currently_enabled) > 1:
+            self.coordinator.saved_enabled_page_uuids = currently_enabled
+
         target_uuid = page_map.get(option)
+        saved_rotation = set(self.coordinator.saved_enabled_page_uuids)
+
+        # If restoring rotation and no previous page state is known, leave pages as they are
+        if option == OPTION_ROTATE_ALL and not saved_rotation:
+            return
 
         new_pages = []
-        enabled_uuids = []
         for page in raw_pages:
             if not isinstance(page, dict):
                 continue
             puuid = str(page.get("uuid") or "")
-            if not puuid or puuid in ("0", SCREEN_OFF_PAGE_UUID):
+            if not puuid or puuid == "0":
                 continue
-            if option == OPTION_ROTATE_ALL or not target_uuid:
-                page["enabled"] = True
+            if option == OPTION_ROTATE_ALL:
+                page["enabled"] = puuid in saved_rotation
             else:
                 page["enabled"] = puuid == target_uuid
-            if page["enabled"]:
-                enabled_uuids.append(puuid)
             new_pages.append(page)
 
-        self.coordinator.saved_enabled_page_uuids = enabled_uuids
+        await self.coordinator.async_save_store()
         conf["pages"] = new_pages
         await self.coordinator.client.apply_conf_and_transition(conf, target_state="widget")
         await self.coordinator.async_refresh_apps_and_pages()

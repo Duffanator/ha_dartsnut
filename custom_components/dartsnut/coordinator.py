@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import copy
 from dataclasses import dataclass, field
 from datetime import timedelta
 import json
@@ -14,13 +13,14 @@ from typing import Any
 
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceInfo
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import DartsnutApiClient, DartsnutError
 from .const import (
     DOMAIN,
     OPTION_ROTATE_ALL,
-    SCREEN_OFF_PAGE_UUID,
+    SIDELOAD_SESSION_ID,
     STATE_LABELS,
     WIDGET_FRIENDLY_NAMES,
 )
@@ -30,6 +30,7 @@ _LOGGER = logging.getLogger(__name__)
 SCAN_INTERVAL = timedelta(seconds=10)
 APPS_REFRESH_INTERVAL = 60.0
 FIRMWARE_REFRESH_INTERVAL = 1800.0
+STORAGE_VERSION = 1
 
 
 @dataclass
@@ -65,10 +66,16 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
         )
         self.client = client
         self.entry_id = entry_id
+        self._store: Store[dict[str, Any]] = Store(
+            hass, STORAGE_VERSION, f"{DOMAIN}.{entry_id}"
+        )
+        self._store_loaded: bool = False
+
         self.last_nonzero_brightness: int = 9
         self.saved_enabled_page_uuids: list[str] = []
         self._state_before_off: str = "widget"
         self._game_before_off: str = ""
+        self._blackout_active: bool = False
 
         self._last_apps_fetch: float = 0.0
         self._last_firmware_fetch: float = 0.0
@@ -79,6 +86,40 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
 
         self._last_screen_png: bytes | None = None
         self._last_screen_at: float = 0.0
+
+    async def async_load_store(self) -> None:
+        """Load persisted state from Home Assistant storage."""
+        if self._store_loaded:
+            return
+        stored = await self._store.async_load()
+        if isinstance(stored, dict):
+            try:
+                lvl = int(stored.get("last_nonzero_brightness", 9))
+                if 1 <= lvl <= 9:
+                    self.last_nonzero_brightness = lvl
+            except (TypeError, ValueError):
+                pass
+            saved_uuids = stored.get("saved_enabled_page_uuids")
+            if isinstance(saved_uuids, list) and all(isinstance(x, str) for x in saved_uuids):
+                self.saved_enabled_page_uuids = [x for x in saved_uuids if x]
+            state_before = stored.get("state_before_off")
+            if isinstance(state_before, str) and state_before:
+                self._state_before_off = state_before
+            game_before = stored.get("game_before_off")
+            if isinstance(game_before, str):
+                self._game_before_off = game_before
+        self._store_loaded = True
+
+    async def async_save_store(self) -> None:
+        """Persist state to Home Assistant storage."""
+        await self._store.async_save(
+            {
+                "last_nonzero_brightness": self.last_nonzero_brightness,
+                "saved_enabled_page_uuids": self.saved_enabled_page_uuids,
+                "state_before_off": self._state_before_off,
+                "game_before_off": self._game_before_off,
+            }
+        )
 
     @property
     def device_name(self) -> str:
@@ -110,23 +151,15 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
             configuration_url=f"http://{self.client.host}:{self.client._mcp_port}/mcp",
         )
 
-    @staticmethod
-    def _is_blank_page_present_and_enabled(pages: list[dict[str, Any]]) -> bool:
-        """Return True if the synthetic screen-off blank page is enabled in pages."""
-        for p in pages:
-            if isinstance(p, dict) and p.get("uuid") == SCREEN_OFF_PAGE_UUID and p.get("enabled", True):
-                return True
-        return False
-
     def get_user_pages(self) -> list[dict[str, Any]]:
-        """Return user-configured widget pages (excluding synthetic blank/default pages)."""
+        """Return user-configured widget pages (excluding synthetic default page 0)."""
         pages = self.data.pages if self.data else self._cached_pages
         return [
             p
             for p in pages
             if isinstance(p, dict)
             and p.get("uuid")
-            and p.get("uuid") not in ("0", SCREEN_OFF_PAGE_UUID)
+            and p.get("uuid") != "0"
         ]
 
     def get_widget_friendly_name(self, widget_id: str) -> str:
@@ -168,13 +201,6 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
         """Return currently selected widget page mode option."""
         user_pages = self.get_user_pages()
         enabled_pages = [p for p in user_pages if p.get("enabled", True)]
-        if not enabled_pages and self.saved_enabled_page_uuids:
-            if len(self.saved_enabled_page_uuids) == 1:
-                target_uuid = self.saved_enabled_page_uuids[0]
-                for idx, p in enumerate(user_pages):
-                    if p.get("uuid") == target_uuid:
-                        return self.get_page_option_label(idx, p)
-            return OPTION_ROTATE_ALL
         if len(enabled_pages) == 1:
             target_uuid = enabled_pages[0].get("uuid")
             for idx, p in enumerate(user_pages):
@@ -201,7 +227,11 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
         raw_state = str(self.data.ui_state.get("state") or "unknown")
         running_game = str(
             self.data.ui_state.get("running_game_id")
-            or self.data.ui_state.get("game_id")
+            or (
+                self.data.ui_state.get("game_id")
+                if raw_state == "in_game"
+                else ""
+            )
             or ""
         ).strip()
         page_index = self.data.ui_state.get("page_index")
@@ -211,7 +241,7 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
         widget_names = [self.get_widget_friendly_name(str(wid)) for wid in widget_ids if wid]
 
         user_pages = self.get_user_pages()
-        if not page_title and page_uuid and page_uuid != SCREEN_OFF_PAGE_UUID:
+        if not page_title and page_uuid:
             for idx, p in enumerate(user_pages):
                 if p.get("uuid") == page_uuid:
                     page_title = str(p.get("title") or f"Page {idx + 1}")
@@ -221,22 +251,14 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
         bottom_widget = widget_names[1] if len(widget_names) >= 2 else ""
 
         enabled_pages = [p for p in user_pages if p.get("enabled", True)]
-        if not enabled_pages and self.saved_enabled_page_uuids:
-            enabled_count = len(self.saved_enabled_page_uuids)
-        else:
-            enabled_count = len(enabled_pages)
 
         attrs: dict[str, Any] = {
             "mode": "Screen Off" if not self.data.screen_on else STATE_LABELS.get(raw_state, raw_state.title()),
             "raw_state": raw_state,
             "screen_on": self.data.screen_on,
             "brightness_level": 0 if not self.data.screen_on else self.data.brightness,
-            "page_number": (
-                (int(page_index) + 1)
-                if isinstance(page_index, int) and page_uuid != SCREEN_OFF_PAGE_UUID
-                else None
-            ),
-            "page_title": "" if page_uuid == SCREEN_OFF_PAGE_UUID else page_title,
+            "page_number": (int(page_index) + 1) if isinstance(page_index, int) else None,
+            "page_title": page_title,
             "page_uuid": page_uuid,
             "widget_ids": widget_ids,
             "widgets": widget_names,
@@ -244,7 +266,7 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
             "bottom_widget": bottom_widget,
             "running_game_id": running_game,
             "total_pages": len(user_pages),
-            "enabled_pages": enabled_count,
+            "enabled_pages": len(enabled_pages),
             "page_mode": self.get_current_page_option(),
         }
 
@@ -274,88 +296,56 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
         return STATE_LABELS.get(raw_state, "Idle"), attrs
 
     async def async_turn_off_screen(self) -> None:
-        """Blank the LED matrix to 100% black across Widget, Menu, and In-Game states."""
+        """Blank the LED matrix to 100% black via sideload without modifying conf.json."""
+        await self.async_load_store()
         if self.data and self.data.brightness > 0:
             self.last_nonzero_brightness = self.data.brightness
 
-        # Fetch fresh UI state right before turning off so we know what state/game to restore
-        try:
-            live_ui = await self.client.get_ui_state()
-        except DartsnutError:
-            live_ui = self.data.ui_state if self.data else {}
+        if not self._blackout_active:
+            try:
+                live_ui = await self.client.get_ui_state()
+            except DartsnutError:
+                live_ui = self.data.ui_state if self.data else {}
 
-        raw_state = str(live_ui.get("state") or "widget")
-        page_uuid = str(live_ui.get("page_uuid") or "")
-        if page_uuid != SCREEN_OFF_PAGE_UUID:
+            raw_state = str(live_ui.get("state") or "widget")
             self._state_before_off = raw_state
-            self._game_before_off = str(
-                live_ui.get("running_game_id") or live_ui.get("game_id") or ""
-            ).strip() if raw_state == "in_game" else ""
-
-        conf = await self.client.get_conf_json()
-        raw_pages = copy.deepcopy(conf.get("pages") or [])
-        user_pages: list[dict[str, Any]] = []
-        currently_enabled: list[str] = []
-
-        for page in raw_pages:
-            if not isinstance(page, dict):
-                continue
-            puuid = str(page.get("uuid") or "")
-            if not puuid or puuid in ("0", SCREEN_OFF_PAGE_UUID):
-                continue
-            if page.get("enabled", True):
-                currently_enabled.append(puuid)
-            page["enabled"] = False
-            user_pages.append(page)
-
-        if currently_enabled:
-            self.saved_enabled_page_uuids = currently_enabled
-
-        blank_page = {
-            "uuid": SCREEN_OFF_PAGE_UUID,
-            "title": "Screen Off",
-            "duration": 3600,
-            "combination": "0",
-            "enabled": True,
-            "widgets": [],
-        }
-        conf["pages"] = [*user_pages, blank_page]
+            self._game_before_off = (
+                str(live_ui.get("running_game_id") or live_ui.get("game_id") or "").strip()
+                if raw_state == "in_game"
+                else ""
+            )
+            await self.async_save_store()
 
         await self.client.set_brightness(0)
-        await self.client.apply_conf_and_transition(conf, target_state="widget")
-        self._last_apps_fetch = 0.0
+        await self.client.sideload_start_blackout()
+        self._blackout_active = True
         await self.async_request_refresh()
 
     async def async_turn_on_screen(self, brightness_level: int | None = None) -> None:
-        """Restore the LED matrix from blank screen-off state and restore prior mode."""
+        """Restore the LED matrix from the blackout session and restore prior mode."""
+        await self.async_load_store()
         level = max(1, min(9, brightness_level or self.last_nonzero_brightness or 9))
         self.last_nonzero_brightness = level
+        await self.async_save_store()
 
-        conf = await self.client.get_conf_json()
-        raw_pages = copy.deepcopy(conf.get("pages") or [])
-        restored_pages: list[dict[str, Any]] = []
-        target_uuids = set(self.saved_enabled_page_uuids)
-
-        for page in raw_pages:
-            if not isinstance(page, dict):
-                continue
-            puuid = str(page.get("uuid") or "")
-            if not puuid or puuid in ("0", SCREEN_OFF_PAGE_UUID):
-                continue
-            page["enabled"] = (puuid in target_uuids) if target_uuids else True
-            restored_pages.append(page)
-
-        conf["pages"] = restored_pages
-
-        restore_state = "menu" if self._state_before_off in ("menu", "game_select", "settings") else "widget"
-        await self.client.apply_conf_and_transition(conf, target_state=restore_state)
+        restore_state = (
+            "menu"
+            if self._state_before_off in ("menu", "game_select", "settings")
+            else "widget"
+        )
+        await self.client.sideload_stop_blackout(target_state=restore_state)
+        self._blackout_active = False
         await self.client.set_brightness(level)
 
         if self._state_before_off == "in_game" and self._game_before_off:
             try:
                 await self.client.start_game(self._game_before_off)
             except DartsnutError as err:
-                _LOGGER.warning("Could not relaunch game %s after screen on: %s", self._game_before_off, err)
+                _LOGGER.warning(
+                    "Could not relaunch game %s after screen on: %s",
+                    self._game_before_off,
+                    err,
+                )
 
         self._last_apps_fetch = 0.0
         await self.async_request_refresh()
@@ -381,6 +371,8 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
 
     async def _async_update_data(self) -> DartsnutData:
         """Fetch latest state from Dartsnut MCP (:9252) and WebSocket (:9251)."""
+        await self.async_load_store()
+
         now = time.monotonic()
         need_apps = (now - self._last_apps_fetch) >= APPS_REFRESH_INTERVAL or not self._cached_pages
         need_fw = (now - self._last_firmware_fetch) >= FIRMWARE_REFRESH_INTERVAL or not self._cached_firmware
@@ -388,6 +380,7 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
         ws_cmds: list[dict[str, Any]] = [
             {"action": "get_device_info"},
             {"action": "get_wifi_rssi"},
+            {"action": "sideload_logs", "session_id": SIDELOAD_SESSION_ID},
         ]
         if need_apps:
             ws_cmds.append({"action": "list_apps"})
@@ -400,6 +393,7 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
 
         device_info: dict[str, Any] = {}
         rssi: int | None = None
+        sideload_running: bool = False
 
         for msg in ws_results:
             action = msg.get("action")
@@ -410,6 +404,8 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
                     rssi = int(msg.get("rssi"))
                 except (TypeError, ValueError):
                     rssi = None
+            elif action == "sideload_logs":
+                sideload_running = bool(msg.get("running"))
             elif action == "list_apps" and "apps" in msg:
                 parsed_apps: list[dict[str, Any]] = []
                 for item in msg.get("apps") or []:
@@ -437,13 +433,21 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
                                 str(p.get("uuid"))
                                 for p in pages
                                 if isinstance(p, dict)
-                                and p.get("uuid") not in (None, "", "0", SCREEN_OFF_PAGE_UUID)
+                                and p.get("uuid") not in (None, "", "0")
                                 and p.get("enabled", True)
                             ]
-                            if enabled_real:
+                            if len(enabled_real) > 1 and enabled_real != self.saved_enabled_page_uuids:
                                 self.saved_enabled_page_uuids = enabled_real
+                                await self.async_save_store()
                 except Exception as err:
                     _LOGGER.debug("Failed to parse conf.json: %s", err)
+
+        self._blackout_active = sideload_running
+        if sideload_running:
+            try:
+                await self.client.sideload_heartbeat()
+            except DartsnutError:
+                pass
 
         if need_fw:
             try:
@@ -456,19 +460,16 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
             brightness = int(device_info.get("brightness", 9))
         except (TypeError, ValueError):
             brightness = 9
-        if brightness > 0:
+        if brightness > 0 and brightness != self.last_nonzero_brightness:
             self.last_nonzero_brightness = brightness
+            await self.async_save_store()
 
         try:
             volume = int(device_info.get("volume", 40))
         except (TypeError, ValueError):
             volume = 40
 
-        blank_page_active = self._is_blank_page_present_and_enabled(self._cached_pages)
-        screen_on = not (
-            blank_page_active
-            or str(ui_state.get("page_uuid") or "") == SCREEN_OFF_PAGE_UUID
-        )
+        screen_on = not sideload_running
 
         return DartsnutData(
             device_info=device_info,

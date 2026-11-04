@@ -7,8 +7,10 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST
 from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.service import async_extract_config_entry_ids
 from homeassistant.helpers.typing import ConfigType
 
 from .api import DartsnutApiClient
@@ -23,7 +25,7 @@ from .const import (
 from .coordinator import DartsnutCoordinator
 
 SERVICE_START_GAME = "start_game"
-SERVICE_START_GAME_SCHEMA = vol.Schema(
+SERVICE_START_GAME_SCHEMA = cv.make_entity_service_schema(
     {
         vol.Required("game_id"): cv.string,
     }
@@ -57,10 +59,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         async def _handle_start_game(call: ServiceCall) -> None:
             game_id = call.data["game_id"]
-            for coord in hass.data.get(DOMAIN, {}).values():
-                if isinstance(coord, DartsnutCoordinator):
-                    await coord.client.start_game(game_id)
-                    await coord.async_request_refresh()
+            entry_ids = await async_extract_config_entry_ids(hass, call)
+            coordinators = [
+                hass.data.get(DOMAIN, {}).get(eid)
+                for eid in entry_ids
+                if isinstance(hass.data.get(DOMAIN, {}).get(eid), DartsnutCoordinator)
+            ]
+            if not coordinators:
+                raise ServiceValidationError(
+                    "No target Dartsnut device or entity was found for start_game"
+                )
+            for coord in coordinators:
+                await coord.client.start_game(game_id)
+                await coord.async_request_refresh()
 
         hass.services.async_register(
             DOMAIN,
@@ -78,4 +89,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id, None)
+        if not hass.data[DOMAIN]:
+            hass.services.async_remove(DOMAIN, SERVICE_START_GAME)
     return unload_ok

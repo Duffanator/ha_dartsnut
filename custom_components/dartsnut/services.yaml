@@ -1,11 +1,16 @@
 start_game:
   name: Start Game
-  description: Launch a game on the Dartsnut board by its game_id.
+  description: Launch a game on the targeted Dartsnut board by its game_id.
+  target:
+    entity:
+      integration: dartsnut
+    device:
+      integration: dartsnut
   fields:
     game_id:
       name: Game ID
-      description: The Dartsnut game identifier (e.g. pico8, cricket, 301).
+      description: The Dartsnut game identifier (e.g. 01dartgame, cricket, pico8).
       required: true
-      example: "pico8"
+      example: "01dartgame"
       selector:
         text:
