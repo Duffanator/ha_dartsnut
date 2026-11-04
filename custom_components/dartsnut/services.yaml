@@ -4,8 +4,6 @@ start_game:
   target:
     entity:
       integration: dartsnut
-    device:
-      integration: dartsnut
   fields:
     game_id:
       name: Game ID

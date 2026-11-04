@@ -24,6 +24,8 @@ from .const import (
 )
 from .coordinator import DartsnutCoordinator
 
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
 SERVICE_START_GAME = "start_game"
 SERVICE_START_GAME_SCHEMA = cv.make_entity_service_schema(
     {
