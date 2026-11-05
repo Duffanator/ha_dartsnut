@@ -455,10 +455,9 @@ class DartsnutApiClient:
             raise DartsnutError("Screen blackout session exited unexpectedly on device")
 
     async def sideload_stop_blackout(self, target_state: str = "widget") -> None:
-        """Stop the blackout session and restore target_state ('widget' or 'menu')."""
+        """Stop an active blackout session and restore target_state ('widget' or 'menu')."""
         want_widget = target_state == "widget"
         if want_widget:
-            # Restart the staged helper in 'wake' mode so it spawns the transition watcher and exits cleanly
             resp = await self.ws_execute(
                 "sideload_update_params",
                 session_id=SIDELOAD_SESSION_ID,
@@ -466,28 +465,7 @@ class DartsnutApiClient:
                 timeout=15.0,
             )
             if resp.get("error"):
-                # If session wasn't active, fall back to a fresh one-shot wake transition
-                script = _build_sideload_helper_script(self._ws_port)
-                b64_main = base64.b64encode(script.encode("utf-8")).decode("ascii")
-                await self.ws_execute_batch(
-                    [
-                        {
-                            "action": "sideload_upload",
-                            "session_id": SIDELOAD_SESSION_ID,
-                            "app_id": SIDELOAD_APP_ID,
-                            "relative_path": "main.py",
-                            "file_data": b64_main,
-                        },
-                        {
-                            "action": "sideload_start",
-                            "session_id": SIDELOAD_SESSION_ID,
-                            "app_id": SIDELOAD_APP_ID,
-                            "size": [128, 160],
-                            "params": {"mode": "wake", "target_state": "widget"},
-                        },
-                    ],
-                    timeout=30.0,
-                )
+                return
             await asyncio.sleep(0.3)
             logs_resp = await self.ws_execute("sideload_logs", session_id=SIDELOAD_SESSION_ID)
             self._raise_for_sideload_errors(logs_resp.get("logs") or [], "Screen wake failed")

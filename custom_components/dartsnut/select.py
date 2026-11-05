@@ -83,7 +83,6 @@ class DartsnutWidgetPageSelect(CoordinatorEntity[DartsnutCoordinator], SelectEnt
         if option == OPTION_ROTATE_ALL and not saved_rotation:
             return
 
-        new_pages = []
         for page in raw_pages:
             if not isinstance(page, dict):
                 continue
@@ -94,10 +93,9 @@ class DartsnutWidgetPageSelect(CoordinatorEntity[DartsnutCoordinator], SelectEnt
                 page["enabled"] = puuid in saved_rotation
             else:
                 page["enabled"] = puuid == target_uuid
-            new_pages.append(page)
 
         await self.coordinator.async_save_store()
-        conf["pages"] = new_pages
+        conf["pages"] = raw_pages
         await self.coordinator.client.apply_conf_and_transition(conf, target_state="widget")
         await self.coordinator.async_refresh_apps_and_pages()
 

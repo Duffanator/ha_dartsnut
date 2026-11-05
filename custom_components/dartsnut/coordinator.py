@@ -73,7 +73,7 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
 
         self.last_nonzero_brightness: int = 9
         self.saved_enabled_page_uuids: list[str] = []
-        self._state_before_off: str = "widget"
+        self._state_before_off: str | None = None
         self._game_before_off: str = ""
         self._blackout_active: bool = False
 
@@ -322,28 +322,43 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
         await self.async_request_refresh()
 
     async def async_turn_on_screen(self, brightness_level: int | None = None) -> None:
-        """Restore the LED matrix from the blackout session and restore prior mode."""
+        """Restore the LED matrix from the blackout session or update brightness if already on."""
         await self.async_load_store()
         level = max(1, min(9, brightness_level or self.last_nonzero_brightness or 9))
         self.last_nonzero_brightness = level
+
+        was_blackout = self._blackout_active or await self.client.is_blackout_running()
+        if not was_blackout:
+            await self.async_save_store()
+            await self.client.set_brightness(level)
+            if self.data:
+                self.data.brightness = level
+                self.async_set_updated_data(self.data)
+            await self.async_request_refresh()
+            return
+
+        prior_state = self._state_before_off or "widget"
+        prior_game = self._game_before_off
+        self._state_before_off = None
+        self._game_before_off = ""
         await self.async_save_store()
 
         restore_state = (
             "menu"
-            if self._state_before_off in ("menu", "game_select", "settings")
+            if prior_state in ("menu", "game_select", "settings")
             else "widget"
         )
         await self.client.sideload_stop_blackout(target_state=restore_state)
         self._blackout_active = False
         await self.client.set_brightness(level)
 
-        if self._state_before_off == "in_game" and self._game_before_off:
+        if prior_state == "in_game" and prior_game:
             try:
-                await self.client.start_game(self._game_before_off)
+                await self.client.start_game(prior_game)
             except DartsnutError as err:
                 _LOGGER.warning(
                     "Could not relaunch game %s after screen on: %s",
-                    self._game_before_off,
+                    prior_game,
                     err,
                 )
 
