@@ -301,7 +301,18 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
         if self.data and self.data.brightness > 0:
             self.last_nonzero_brightness = self.data.brightness
 
-        if not self._blackout_active:
+        was_blackout = self._blackout_active or await self.client.is_blackout_running()
+        if was_blackout:
+            self._blackout_active = True
+            await self.client.sideload_heartbeat()
+            await self.client.set_brightness(0)
+            if self.data:
+                self.data.screen_on = False
+                self.data.brightness = 0
+                self.async_set_updated_data(self.data)
+            return
+
+        if self._state_before_off is None:
             try:
                 live_ui = await self.client.get_ui_state()
             except DartsnutError:

@@ -114,7 +114,7 @@ if not os.path.exists({{PDOSHM_PATH!r}}):
     raise SystemExit(1)
 fd = os.open({{PDOSHM_PATH!r}}, os.O_RDWR)
 m = mmap.mmap(fd, 0)
-for _ in range(30):
+for _ in range(60):
     try:
         with open({{UI_STATE_PATH!r}}, encoding="utf-8") as f:
             st = json.load(f).get("state")
@@ -420,6 +420,10 @@ class DartsnutApiClient:
 
     async def sideload_start_blackout(self) -> None:
         """Start the 128x160 black-canvas sideload session without modifying conf.json."""
+        if await self.is_blackout_running():
+            await self.sideload_heartbeat()
+            return
+
         script = _build_sideload_helper_script(self._ws_port)
         b64_main = base64.b64encode(script.encode("utf-8")).decode("ascii")
         results = await self.ws_execute_batch(
@@ -484,6 +488,14 @@ class DartsnutApiClient:
         target_state: str = "widget",
     ) -> None:
         """Atomically write apps/conf.json on the main loop and transition to target_state."""
+        if await self.is_blackout_running():
+            await self.ws_execute(
+                "sideload_stop",
+                session_id=SIDELOAD_SESSION_ID,
+                timeout=10.0,
+            )
+            await asyncio.sleep(0.2)
+
         script = _build_sideload_helper_script(self._ws_port)
         b64_main = base64.b64encode(script.encode("utf-8")).decode("ascii")
         conf_b64 = base64.b64encode(json.dumps(conf_data).encode("utf-8")).decode("ascii")
