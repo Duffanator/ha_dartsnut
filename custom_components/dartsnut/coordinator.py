@@ -75,6 +75,7 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
         self.saved_enabled_page_uuids: list[str] = []
         self._state_before_off: str | None = None
         self._game_before_off: str = ""
+        self._desired_screen_off: bool = False
         self._blackout_active: bool = False
 
         self._last_apps_fetch: float = 0.0
@@ -83,6 +84,7 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
         self._cached_pages: list[dict[str, Any]] = []
         self._cached_conf_raw: dict[str, Any] = {}
         self._cached_firmware: dict[str, Any] = {}
+        self._cached_ui_state: dict[str, Any] = {}
 
         self._last_screen_png: bytes | None = None
         self._last_screen_at: float = 0.0
@@ -108,6 +110,8 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
             game_before = stored.get("game_before_off")
             if isinstance(game_before, str):
                 self._game_before_off = game_before
+            if "desired_screen_off" in stored:
+                self._desired_screen_off = bool(stored.get("desired_screen_off"))
         self._store_loaded = True
 
     async def async_save_store(self) -> None:
@@ -118,6 +122,7 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
                 "saved_enabled_page_uuids": self.saved_enabled_page_uuids,
                 "state_before_off": self._state_before_off,
                 "game_before_off": self._game_before_off,
+                "desired_screen_off": self._desired_screen_off,
             }
         )
 
@@ -301,9 +306,11 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
         if self.data and self.data.brightness > 0:
             self.last_nonzero_brightness = self.data.brightness
 
+        self._desired_screen_off = True
         was_blackout = self._blackout_active or await self.client.is_blackout_running()
         if was_blackout:
             self._blackout_active = True
+            await self.async_save_store()
             await self.client.sideload_heartbeat()
             await self.client.set_brightness(0)
             if self.data:
@@ -316,7 +323,7 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
             try:
                 live_ui = await self.client.get_ui_state()
             except DartsnutError:
-                live_ui = self.data.ui_state if self.data else {}
+                live_ui = self.data.ui_state if self.data else self._cached_ui_state
 
             raw_state = str(live_ui.get("state") or "widget")
             self._state_before_off = raw_state
@@ -325,10 +332,12 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
                 if raw_state == "in_game"
                 else ""
             )
-            await self.async_save_store()
+
+        await self.async_save_store()
+        restore_to_widget = self._state_before_off not in ("menu", "game_select", "settings")
 
         await self.client.set_brightness(0)
-        await self.client.sideload_start_blackout()
+        await self.client.sideload_start_blackout(restore_to_widget=restore_to_widget)
         self._blackout_active = True
         await self.async_request_refresh()
 
@@ -337,6 +346,7 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
         await self.async_load_store()
         level = max(1, min(9, brightness_level or self.last_nonzero_brightness or 9))
         self.last_nonzero_brightness = level
+        self._desired_screen_off = False
 
         was_blackout = self._blackout_active or await self.client.is_blackout_running()
         if not was_blackout:
@@ -408,6 +418,8 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
             {"action": "get_wifi_rssi"},
             {"action": "sideload_logs", "session_id": SIDELOAD_SESSION_ID},
         ]
+        if self._blackout_active or self._desired_screen_off:
+            ws_cmds.append({"action": "sideload_heartbeat", "session_id": SIDELOAD_SESSION_ID})
         if need_apps:
             ws_cmds.append({"action": "list_apps"})
             ws_cmds.append({"action": "get_file", "file_name": "conf.json"})
@@ -468,12 +480,17 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
                 except Exception as err:
                     _LOGGER.debug("Failed to parse conf.json: %s", err)
 
-        self._blackout_active = sideload_running
-        if sideload_running:
+        # Self-heal blackout if desired_screen_off is True but the sideload process exited
+        if self._desired_screen_off and not sideload_running:
+            restore_to_widget = self._state_before_off not in ("menu", "game_select", "settings")
             try:
-                await self.client.sideload_heartbeat()
-            except DartsnutError:
-                pass
+                await self.client.set_brightness(0)
+                await self.client.sideload_start_blackout(restore_to_widget=restore_to_widget)
+                sideload_running = True
+            except DartsnutError as err:
+                _LOGGER.debug("Could not re-establish blackout session: %s", err)
+
+        self._blackout_active = sideload_running
 
         if need_fw:
             try:
@@ -513,8 +530,23 @@ class DartsnutCoordinator(DataUpdateCoordinator[DartsnutData]):
     async def _gather_core(
         self, ws_cmds: list[dict[str, Any]]
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        """Fetch MCP get_ui_state and WebSocket batch concurrently."""
-        ui_task = self.client.get_ui_state()
-        ws_task = self.client.ws_execute_batch(ws_cmds)
-        ui_state, ws_results = await asyncio.gather(ui_task, ws_task)
+        """Fetch MCP get_ui_state and WebSocket batch concurrently.
+
+        If get_ui_state times out due to on-device DNS/ping checks while the local
+        WebSocket succeeds, fall back to the cached UI state snapshot rather than
+        failing the entire poll cycle.
+        """
+        ui_task = asyncio.create_task(self.client.get_ui_state())
+        ws_task = asyncio.create_task(self.client.ws_execute_batch(ws_cmds))
+        ws_results = await ws_task
+        try:
+            ui_state = await ui_task
+            if ui_state:
+                self._cached_ui_state = ui_state
+        except DartsnutError as err:
+            if self._cached_ui_state:
+                _LOGGER.debug("MCP get_ui_state timed out, using cached UI state: %s", err)
+                ui_state = self._cached_ui_state
+            else:
+                raise
         return ui_state, ws_results

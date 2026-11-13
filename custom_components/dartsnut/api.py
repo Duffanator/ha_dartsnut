@@ -30,11 +30,11 @@ def _build_sideload_helper_script(ws_port: int) -> str:
     """Build the sideload helper script without hardcoded install paths.
 
     Modes controlled via --params JSON:
-    - mode == 'blackout': Validates /dev/shm/pdoshm, keeps the 128x160 black
-      sideload canvas active by sending local WebSocket heartbeats every 8s.
-    - mode == 'wake': Validates required paths, optionally spawns a detached
-      watcher to pulse btn_home (pdoshm[0]=64) once init_widgets finishes so
-      the board transitions from MenuState to WidgetState, and exits cleanly.
+    - mode == 'blackout': Validates /dev/shm/pdoshm, optionally spawns a detached
+      watcher (when restore_to_widget is True) that waits for the blackout process
+      to exit and transitions MenuState -> WidgetState once init_widgets finishes,
+      and keeps the 128x160 black sideload canvas active by sending local WebSocket
+      heartbeats every 5s.
     - mode == 'apply_conf': Validates relative ../../../conf.json path, writes
       the updated pages config atomically, optionally transitions to WidgetState,
       and exits cleanly.
@@ -45,7 +45,6 @@ import json
 import os
 import shutil
 import socket
-import struct
 import subprocess
 import sys
 import time
@@ -62,7 +61,7 @@ def fail(msg: str) -> None:
 
 
 def send_local_heartbeat(port: int, session_id: str) -> None:
-    s = socket.create_connection(("127.0.0.1", port), timeout=5)
+    s = socket.create_connection(("127.0.0.1", port), timeout=4)
     try:
         key = base64.b64encode(os.urandom(16)).decode("ascii")
         handshake = (
@@ -106,31 +105,36 @@ def spawn_widget_transition_watcher() -> None:
 while True:
     try:
         os.kill({{parent_pid}}, 0)
-        time.sleep(0.05)
+        time.sleep(0.1)
     except OSError:
         break
-time.sleep(1.5)
+exit_time = time.time()
+time.sleep(0.5)
 if not os.path.exists({{PDOSHM_PATH!r}}):
     raise SystemExit(1)
 fd = os.open({{PDOSHM_PATH!r}}, os.O_RDWR)
 m = mmap.mmap(fd, 0)
-for _ in range(60):
+saw_menu = False
+for _ in range(90):
     try:
+        mtime = os.stat({{UI_STATE_PATH!r}}).st_mtime
         with open({{UI_STATE_PATH!r}}, encoding="utf-8") as f:
             st = json.load(f).get("state")
     except Exception:
+        mtime = 0.0
         st = ""
-    if st == "widget":
-        break
-    if st == "menu":
+    if mtime >= exit_time - 0.5 and st == "menu":
+        saw_menu = True
         end = time.monotonic() + 0.12
         while time.monotonic() < end:
             m[0] = 64
             time.sleep(0.001)
         m[0] = 0
-        time.sleep(1.1)
-    else:
-        time.sleep(0.2)
+        time.sleep(1.2)
+        continue
+    if saw_menu and st == "widget":
+        break
+    time.sleep(0.2)
 m.close()
 os.close(fd)
 \"\"\"
@@ -153,13 +157,16 @@ def main() -> None:
     mode = params.get("mode", "blackout")
     port = int(params.get("ws_port", {ws_port}))
     target_state = params.get("target_state", "widget")
+    restore_to_widget = bool(params.get("restore_to_widget", True))
 
     if mode == "blackout":
         if not os.path.exists(PDOSHM_PATH):
             fail(f"Required shared memory path does not exist: {{PDOSHM_PATH}}")
+        if restore_to_widget:
+            spawn_widget_transition_watcher()
         print("READY", flush=True)
         while True:
-            time.sleep(8)
+            time.sleep(5)
             try:
                 send_local_heartbeat(port, {SIDELOAD_SESSION_ID!r})
             except Exception:
@@ -241,7 +248,7 @@ class DartsnutApiClient:
         self,
         name: str,
         arguments: dict[str, Any] | None = None,
-        timeout: float = 10.0,
+        timeout: float = 15.0,
     ) -> dict[str, Any]:
         """Call a tool on the Dartsnut MCP HTTP server (:9252/mcp)."""
         payload = {
@@ -277,7 +284,7 @@ class DartsnutApiClient:
 
     async def get_ui_state(self) -> dict[str, Any]:
         """Get UI and network state snapshot via MCP."""
-        result = await self.call_mcp_tool("get_ui_state", timeout=8.0)
+        result = await self.call_mcp_tool("get_ui_state", timeout=15.0)
         structured = result.get("structuredContent")
         if isinstance(structured, dict):
             return structured
@@ -291,7 +298,7 @@ class DartsnutApiClient:
         result = await self.call_mcp_tool(
             "capture_screen",
             {"surface": surface, "format": "png"},
-            timeout=8.0,
+            timeout=10.0,
         )
         for item in result.get("content") or []:
             if isinstance(item, dict) and item.get("type") == "image" and item.get("data"):
@@ -418,7 +425,7 @@ class DartsnutApiClient:
             timeout=8.0,
         )
 
-    async def sideload_start_blackout(self) -> None:
+    async def sideload_start_blackout(self, *, restore_to_widget: bool = True) -> None:
         """Start the 128x160 black-canvas sideload session without modifying conf.json."""
         if await self.is_blackout_running():
             await self.sideload_heartbeat()
@@ -443,6 +450,7 @@ class DartsnutApiClient:
                     "params": {
                         "mode": "blackout",
                         "ws_port": self._ws_port,
+                        "restore_to_widget": restore_to_widget,
                     },
                 },
             ],
@@ -459,27 +467,16 @@ class DartsnutApiClient:
             raise DartsnutError("Screen blackout session exited unexpectedly on device")
 
     async def sideload_stop_blackout(self, target_state: str = "widget") -> None:
-        """Stop an active blackout session and restore target_state ('widget' or 'menu')."""
+        """Stop an active blackout session and wait for target_state restoration."""
         want_widget = target_state == "widget"
+        await self.ws_execute(
+            "sideload_stop",
+            session_id=SIDELOAD_SESSION_ID,
+            timeout=10.0,
+        )
         if want_widget:
-            resp = await self.ws_execute(
-                "sideload_update_params",
-                session_id=SIDELOAD_SESSION_ID,
-                params={"mode": "wake", "target_state": "widget"},
-                timeout=15.0,
-            )
-            if resp.get("error"):
-                return
-            await asyncio.sleep(0.3)
-            logs_resp = await self.ws_execute("sideload_logs", session_id=SIDELOAD_SESSION_ID)
-            self._raise_for_sideload_errors(logs_resp.get("logs") or [], "Screen wake failed")
-            await asyncio.sleep(2.4)
+            await asyncio.sleep(3.2)
         else:
-            await self.ws_execute(
-                "sideload_stop",
-                session_id=SIDELOAD_SESSION_ID,
-                timeout=10.0,
-            )
             await asyncio.sleep(1.2)
 
     async def apply_conf_and_transition(
@@ -535,6 +532,6 @@ class DartsnutApiClient:
             "Applying widget page configuration failed",
         )
         if want_widget:
-            await asyncio.sleep(2.4)
+            await asyncio.sleep(3.0)
         else:
             await asyncio.sleep(1.0)

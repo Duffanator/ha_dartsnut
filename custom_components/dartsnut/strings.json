@@ -9,6 +9,15 @@
           "ws_port": "WebSocket Port",
           "mcp_port": "MCP HTTP Port"
         }
+      },
+      "reconfigure": {
+        "title": "Reconfigure Dartsnut PixelDart",
+        "description": "Update the IP address, hostname, or ports for your Dartsnut Raspberry Pi.",
+        "data": {
+          "host": "Host / IP Address",
+          "ws_port": "WebSocket Port",
+          "mcp_port": "MCP HTTP Port"
+        }
       }
     },
     "error": {
@@ -16,7 +25,25 @@
       "unknown": "Unexpected error"
     },
     "abort": {
-      "already_configured": "Device is already configured"
+      "already_configured": "Device is already configured",
+      "reconfigure_successful": "Configuration updated successfully"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Configure Dartsnut PixelDart",
+        "description": "Update the IP address, hostname, or ports for your Dartsnut Raspberry Pi.",
+        "data": {
+          "host": "Host / IP Address",
+          "ws_port": "WebSocket Port",
+          "mcp_port": "MCP HTTP Port"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to Dartsnut device on WebSocket/MCP ports",
+      "unknown": "Unexpected error"
     }
   }
 }
